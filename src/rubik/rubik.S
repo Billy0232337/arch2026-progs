@@ -1,5 +1,5 @@
 # Assignment 2 Rubik solver, RV32I + Zicsr, no M/C/F/D instructions.
-# V2: current-frame pointer and threshold-aware heuristic lookup.
+# V3: cached per-face transition bases, direct frame access and pruning.
 # Lookup tables are declared within this Assembly object via a textual include.
 # The C header is deliberately left unchanged.
 # ABI: a0=state, a1=out, a2=cap; return a0=length/-1/-2.
@@ -8,7 +8,7 @@
     .section .bss
     .balign 4
 rubik_asm_dfs_stack:
-    .space 144          # 12 frames * 12 bytes
+    .space 240          # 12 frames * 20 bytes
 rubik_asm_solution:
     .space 11
 
@@ -65,7 +65,7 @@ rubik_ida_bound_start:
     beq t0, zero, rubik_solution_found
     beq s7, zero, rubik_ida_next_bound
 
-    # Explicit DFS frame: p.h,o.h,next_p.h,next_o.h,previous_face.b,face.b,turn.b,pad.
+    # DFS frame (20 B): p.h,o.h,next_p.h,next_o.h,previous_face.b,face.b,turn.b,pad,perm_base.w,orient_base.w.
     # Reinitialize root pointer for each increasing IDA* bound.
     la s5, rubik_asm_dfs_stack
     li s8, 0
@@ -77,53 +77,38 @@ rubik_ida_bound_start:
     sb t0, 8(s5)
     sb zero, 9(s5)
     sb zero, 10(s5)
+    sw s0, 12(s5)       # face 0 permutation transition base
+    sw s1, 16(s5)       # face 0 orientation transition base
 
 rubik_search_loop:
-    # V2: s5 is the current DFS frame, not the stack base.
-    # Push/pop update it by exactly one 12-byte frame.
-    mv t0, s5
-
-    lbu t1, 9(t0)
+    # s5 is the current DFS frame. Each frame caches its active
+    # face's permutation and orientation transition bases.
+    lbu t1, 9(s5)
     li t2, 3
     bgeu t1, t2, rubik_frame_exhausted
-    lbu t2, 8(t0)
+    lbu t2, 8(s5)
     beq t1, t2, rubik_advance_face
-    lbu t3, 10(t0)
+    lbu t3, 10(s5)
     li t2, 3
     bgeu t3, t2, rubik_advance_face
 
-    mv a5, t1          # save face across heuristic
-    mv a6, t3          # save old turn across heuristic
-    lhu t4, 4(t0)
-    lhu t5, 6(t0)
-
-    beq t1, zero, rubik_trans_face0
-    li t2, 1
-    beq t1, t2, rubik_trans_face1
-    li t6, 20160
-    li t2, 2916
-    j rubik_trans_base_ready
-rubik_trans_face1:
-    li t6, 10080
-    li t2, 1458
-    j rubik_trans_base_ready
-rubik_trans_face0:
-    li t6, 0
-    li t2, 0
-rubik_trans_base_ready:
-    add t6, s0, t6
+    mv a5, t1          # preserve face across the leaf test
+    mv a6, t3          # preserve turn across the leaf test
+    lhu t4, 4(s5)
+    lhu t5, 6(s5)
+    lw t6, 12(s5)     # per-face permutation transition table
+    lw t2, 16(s5)     # per-face orientation transition table
     slli a4, t4, 1
     add a4, t6, a4
     lhu a2, 0(a4)
-    add t2, s1, t2
     slli a4, t5, 1
     add a4, t2, a4
     lhu a3, 0(a4)
 
-    sh a2, 4(t0)
-    sh a3, 6(t0)
+    sh a2, 4(s5)
+    sh a3, 6(s5)
     addi t3, t3, 1
-    sb t3, 10(t0)
+    sb t3, 10(s5)
     addi a4, s8, 1
     mv a0, a2
     mv a1, a3
@@ -132,8 +117,7 @@ rubik_trans_base_ready:
     # Preserve a2: it still holds the child permutation rank.
     sub a7, s7, a4
     jal ra, rubik_heuristic_limited
-    add t1, a4, a0
-    bltu s7, t1, rubik_search_loop
+    bltu a7, a0, rubik_search_loop
 
     slli t1, a5, 1
     add t1, t1, a5
@@ -145,31 +129,42 @@ rubik_trans_base_ready:
     beq a4, s7, rubik_search_loop
 
     mv s8, a4
-    addi s5, s5, 12
-    mv t0, s5
-    sh a2, 0(t0)
-    sh a3, 2(t0)
-    sh a2, 4(t0)
-    sh a3, 6(t0)
-    sb a5, 8(t0)
-    sb zero, 9(t0)
-    sb zero, 10(t0)
+    addi s5, s5, 20
+    sh a2, 0(s5)
+    sh a3, 2(s5)
+    sh a2, 4(s5)
+    sh a3, 6(s5)
+    sb a5, 8(s5)
+    sb zero, 9(s5)
+    sb zero, 10(s5)
+    sw s0, 12(s5)       # start the new frame at face 0
+    sw s1, 16(s5)
     j rubik_search_loop
 
 rubik_advance_face:
     addi t1, t1, 1
-    sb t1, 9(t0)
-    sb zero, 10(t0)
-    lhu t2, 0(t0)
-    lhu t3, 2(t0)
-    sh t2, 4(t0)
-    sh t3, 6(t0)
+    sb t1, 9(s5)
+    sb zero, 10(s5)
+    lhu t2, 0(s5)
+    lhu t3, 2(s5)
+    sh t2, 4(s5)
+    sh t3, 6(s5)
+    # Both transition tables have three equally sized face slices.
+    # Increment their base once per face, not once per attempted turn.
+    lw t4, 12(s5)
+    li t5, 10080       # 5040 permutation entries * 2 bytes
+    add t4, t4, t5
+    sw t4, 12(s5)
+    lw t4, 16(s5)
+    li t5, 1458        # 729 orientation entries * 2 bytes
+    add t4, t4, t5
+    sw t4, 16(s5)
     j rubik_search_loop
 
 rubik_frame_exhausted:
     beq s8, zero, rubik_ida_next_bound
     addi s8, s8, -1
-    addi s5, s5, -12
+    addi s5, s5, -20
     j rubik_search_loop
 
 rubik_ida_next_bound:
